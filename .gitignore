@@ -1,0 +1,15 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime state
+config.json
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
