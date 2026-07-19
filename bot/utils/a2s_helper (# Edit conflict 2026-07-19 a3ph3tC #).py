@@ -5,19 +5,12 @@ Queries ATS/ETS2 dedicated servers for player count and server info.
 """
 
 import os
-from typing import Tuple, Optional
-
 import a2s
+from typing import Tuple, Optional
 
 SERVER_IP = os.getenv("A2S_HOST", "51.222.255.93")
 DEFAULT_QUERY_PORT = int(os.getenv("A2S_PORT", "22006"))
 TIMEOUT = 5.0
-
-
-def _get_query_target(override_ip: Optional[str] = None, override_port: Optional[int] = None):
-    ip = override_ip or SERVER_IP
-    port = override_port or DEFAULT_QUERY_PORT
-    return ip, port
 
 
 def _candidate_ports(override_port: int = None):
@@ -33,18 +26,6 @@ def _candidate_ports(override_port: int = None):
     return ports
 
 
-def _query_a2s_packet(ip: str, port: int):
-    """Query server info using python-a2s."""
-    info = a2s.info((ip, port), timeout=TIMEOUT)
-    return info
-
-
-def _parse_a2s_info(payload):
-    if payload is None:
-        raise ValueError("No response received")
-    return payload
-
-
 def query_server(max_players: int = 8, override_ip: str = None, override_port: int = None) -> Tuple[bool, int, Optional[int]]:
     """
     Query ATS server for status.
@@ -55,14 +36,19 @@ def query_server(max_players: int = 8, override_ip: str = None, override_port: i
         - player_count: Number of connected players
         - max_players: Server max capacity (None if unknown)
     """
-    ip, port = _get_query_target(override_ip, override_port)
+    ip = override_ip or SERVER_IP
     last_error = None
 
-    for candidate_port in _candidate_ports(port):
+    for port in _candidate_ports(override_port):
         try:
-            payload = _query_a2s_packet(ip, candidate_port)
-            _parse_a2s_info(payload)
-            return True, payload.player_count, payload.max_players or max_players
+            addr = (ip, port)
+            info = a2s.info(addr, timeout=TIMEOUT)
+            players = a2s.players(addr, timeout=TIMEOUT)
+
+            online = True
+            player_count = len(players) if players else 0
+            server_max = info.max_players if hasattr(info, 'max_players') and info.max_players else max_players
+            return online, player_count, server_max
         except Exception as exc:
             last_error = exc
 
@@ -71,19 +57,20 @@ def query_server(max_players: int = 8, override_ip: str = None, override_port: i
 
 def get_server_info(override_ip: str = None, override_port: int = None) -> dict:
     """Get detailed server information."""
-    ip, port = _get_query_target(override_ip, override_port)
+    ip = override_ip or SERVER_IP
     last_error = None
 
-    for candidate_port in _candidate_ports(port):
+    for port in _candidate_ports(override_port):
         try:
-            payload = _query_a2s_packet(ip, candidate_port)
-            _parse_a2s_info(payload)
+            addr = (ip, port)
+            info = a2s.info(addr, timeout=TIMEOUT)
+
             return {
-                "server_name": payload.server_name,
-                "map": payload.map_name,
-                "player_count": payload.player_count,
-                "max_players": payload.max_players,
-                "password_protected": payload.password_protected,
+                "server_name": getattr(info, 'server_name', 'Unknown'),
+                "map": getattr(info, 'map_name', 'Unknown'),
+                "player_count": getattr(info, 'player_count', 0),
+                "max_players": getattr(info, 'max_players', 0),
+                "password_protected": getattr(info, 'password_protected', False),
                 "online": True,
             }
         except Exception as exc:
@@ -101,9 +88,8 @@ def get_server_info(override_ip: str = None, override_port: int = None) -> dict:
 
 def build_name(prefix: str, online: bool, players: int, maxp: int) -> str:
     """Build channel/voice name from server status."""
-    indicator = "🟢" if online else "🔴"
     if not online:
-        return f"{indicator} {prefix} | OFFLINE"
-
+        return f"{prefix} | OFFLINE"
+    
     maxp = maxp or "?"
-    return f"{indicator} {prefix} | {players}/{maxp}"
+    return f"{prefix} | {players}/{maxp}"

@@ -19,7 +19,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 # ------------------------------------------------------------------
-# Async cog loader – skips __init__.py (which isn’t a cog)
+# Async cog loader – skips __init__.py (which isn't a cog)
 # ------------------------------------------------------------------
 async def load_all_cogs():
     cog_dir = os.path.join(os.path.dirname(__file__), "cogs")
@@ -37,7 +37,18 @@ async def load_all_cogs():
 @bot.event
 async def on_ready():
     from .config import cfg
-    print(f"🚀 {bot.user} is online – config: {cfg}")
+    # Print config without exposing secrets
+    safe_cfg = {k: v for k, v in cfg.__dict__.items() 
+                if not any(s in k.lower() for s in ['pass', 'token', 'secret', 'webhook'])}
+    print(f"🚀 {bot.user} is online – config: {safe_cfg}")
+    
+    # Sync slash commands with Discord (only once per session)
+    try:
+        print("[*] Syncing slash commands...")
+        synced = await bot.tree.sync()
+        print(f"[✓] Synced {len(synced)} slash command(s) globally")
+    except Exception as exc:
+        print(f"[!] Failed to sync commands: {exc!r}")
 
 
 @bot.event

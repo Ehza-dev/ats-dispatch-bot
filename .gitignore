@@ -1,15 +1,63 @@
-# Secrets
-.env
-
-# Python
-.venv/
+# ────────────────────────────────
+# Python / virtual‑env artifacts
+# ────────────────────────────────
 __pycache__/
+*.py[cod]          # .pyc, .pyo, .pyd
+*.pyo
 *.pyc
+*.egg-info/
+dist/
+build/
+*.manifest
+*.spec
 
-# Runtime state
+# Virtual‑environment directories (if you use venv, conda, poetry, etc.)
+venv/
+.env/
+ENV/
+env/
+.venv/
+.conda/
+.conda_env/
+
+# ────────────────────────────────
+# Secrets & configuration
+# ────────────────────────────────
+# Your .env holds tokens, API keys, DB passwords, etc.
+# Never commit it – the line below guarantees that.
+.env
+# If you keep a copy for local testing, name it .env.example
+# (you can commit the example, just without real values)
+.env.example
+
+# config.json may contain channel IDs, redirect VC IDs, etc.
+# If you consider those IDs public, you can keep the file;
+# otherwise, treat it like a secret.
 config.json
 
-# OS/editor noise
-.DS_Store
+# Local runtime data and caches that may include sensitive state.
+tracker.db
+tracker.db-journal
+ftp_offset.json
+*.sqlite
+*.sqlite3
+
+# ────────────────────────────────
+# IDE / editor junk
+# ────────────────────────────────
 .vscode/
 .idea/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.bak
+.DS_Store
+Thumbs.db
+
+# ────────────────────────────────
+# Logs & runtime data
+# ────────────────────────────────
+*.log
+logs/
+tracker.db
+ftp_offset.json
