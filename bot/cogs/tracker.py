@@ -255,11 +255,11 @@ class TrackerCog(commands.Cog):
         set_persistent_message("monthly_leaderboard", msg.id, channel.id)
         await interaction.response.send_message("✅ Leaderboard posted! It will auto-update as players join/leave.", ephemeral=True)
 
-    @app_commands.command(name="global", description="Show top players by all-time playtime")
+    @app_commands.command(name="lifetime", description="Show top players by all-time playtime")
     async def cmd_global(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         embed = self._build_leaderboard_embed(global_=True)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="playtime", description="Show playtime stats for a player")
     @app_commands.describe(player="Player name to look up")
