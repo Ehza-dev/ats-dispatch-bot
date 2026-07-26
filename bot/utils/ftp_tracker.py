@@ -20,7 +20,9 @@ DB_PATH = Path(__file__).parent.parent / "tracker.db"
 STATE_PATH = Path(__file__).parent.parent / "ftp_offset.json"
 
 # Regex patterns for ATS log format
-# Join: [MP] PlayerName connected, client_id = XX (guess — verify with your logs)
+# Uptime: HH:MM:SS.mmm from lines like "62:42:06.446 : [MP] ..."
+UPTIME_RE = re.compile(r'^(\d+):(\d{2}):(\d{2})\.(\d{3})')
+# Join: [MP] PlayerName connected, client_id = XX
 JOIN_RE = re.compile(
     r'\[MP\] (.+?) connected, client_id = \d+'
 )
@@ -135,9 +137,9 @@ def record_join(conn, name, period=None):
     )
     conn.commit()
 
-def record_leave(conn, name, join_time_str, period=None):
+def record_leave(conn, name, join_time_str, period=None, override_leave_time=None):
     join_time = datetime.fromisoformat(join_time_str)
-    leave_time = datetime.utcnow()
+    leave_time = override_leave_time or datetime.utcnow()
     duration = int((leave_time - join_time).total_seconds())
     if period is None:
         period = get_current_period()
@@ -194,32 +196,31 @@ def _connect_ftp(retries=2):
     raise last_error
 
 
-def fetch_log_new_bytes(last_size):
+def fetch_log_new_bytes(last_uptime_seconds):
+    """Fetch all log lines and return them with latest uptime. Handles log rotation."""
     try:
         ftp = _connect_ftp()
-        try:
-            size = ftp.size(cfg.log_file) or 0
-        except Exception:
-            print("[Tracker] Could not get file size, assuming 0")
-            size = 0
-
-        if size <= last_size:
-            ftp.quit()
-            return [], last_size
-
-        ftp.sendcmd(f"REST {last_size}")
-
         chunks = []
         ftp.retrbinary(f"RETR {cfg.log_file}", chunks.append)
         ftp.quit()
 
         content = b"".join(chunks).decode("utf-8", errors="replace")
         lines = content.splitlines()
-        return lines, size
+        
+        # Extract latest uptime from last log line
+        latest_uptime_seconds = last_uptime_seconds
+        for line in reversed(lines):
+            m = UPTIME_RE.search(line)
+            if m:
+                hours, mins, secs, ms = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                latest_uptime_seconds = hours * 3600 + mins * 60 + secs + (ms / 1000)
+                break
+        
+        return lines, latest_uptime_seconds
 
     except Exception as e:
         print(f"[Tracker] FTP error: {e}")
-        return [], last_size
+        return [], last_uptime_seconds
 
 
 def fetch_log_content():
@@ -244,12 +245,13 @@ def fetch_log_content():
 
 
 def replay_log_events(lines, conn=None, period=None):
+    """Replay events from log lines (used for backfill)."""
     if conn is None:
         conn = init_db()
 
     active_sessions = {}
     events = parse_events(lines)
-    for event_type, name in events:
+    for event_type, name, uptime_seconds in events:
         if event_type == "join":
             if name not in active_sessions:
                 active_sessions[name] = datetime.utcnow().isoformat()
@@ -261,16 +263,25 @@ def replay_log_events(lines, conn=None, period=None):
 
     return len(events)
 
-def parse_events(lines):
-    """Parse [MP] join/leave events. Deduplicates within batch, filters [Chat] lines."""
+def parse_events(lines, last_uptime_seconds=None):
+    """Parse [MP] join/leave events. Deduplicates within batch, filters [Chat] lines.
+    Returns list of (event_type, player_name, uptime_seconds) tuples.
+    """
     events = []
-    seen_lines = set()  # Track exact lines already processed in this batch
+    seen_lines = set()
+    current_uptime = last_uptime_seconds or 0
     
     for line in lines:
         # Skip if already seen in this batch (dedup)
         if line.strip() in seen_lines:
             continue
         seen_lines.add(line.strip())
+        
+        # Extract uptime from this line
+        m_uptime = UPTIME_RE.search(line)
+        if m_uptime:
+            hours, mins, secs, ms = int(m_uptime.group(1)), int(m_uptime.group(2)), int(m_uptime.group(3)), int(m_uptime.group(4))
+            current_uptime = hours * 3600 + mins * 60 + secs + (ms / 1000)
         
         # Skip [Chat] lines — duplicates
         if CHAT_RE.match(line):
@@ -279,13 +290,13 @@ def parse_events(lines):
         # Check for disconnect
         m = LEAVE_RE.search(line)
         if m:
-            events.append(("leave", m.group(1)))
+            events.append(("leave", m.group(1), current_uptime))
             continue
         
         # Check for connect
         m = JOIN_RE.search(line)
         if m:
-            events.append(("join", m.group(1)))
+            events.append(("join", m.group(1), current_uptime))
             continue
     
     return events
@@ -301,15 +312,87 @@ def format_duration(seconds):
     return f"{secs}s"
 
 def load_offset():
+    """Load last known server uptime in seconds (migrates from old byte-offset format)."""
     if STATE_PATH.exists():
         try:
-            return json.loads(STATE_PATH.read_text()).get("size", 0)
+            data = json.loads(STATE_PATH.read_text())
+            # Support new format
+            if "last_uptime_seconds" in data:
+                return data["last_uptime_seconds"]
+            # Migrate old byte-offset format
+            if "size" in data:
+                print("[Tracker] Migrating from byte-offset to uptime tracking")
+                return 0
         except Exception:
             pass
     return 0
 
-def save_offset(size):
-    STATE_PATH.write_text(json.dumps({"size": size}))
+def save_offset(uptime_seconds, last_known_iso=None):
+    """Save last known server uptime in seconds and last event timestamp."""
+    data = {"last_uptime_seconds": uptime_seconds}
+    if last_known_iso:
+        data["last_known_iso"] = last_known_iso
+    STATE_PATH.write_text(json.dumps(data))
+
+def load_last_known_iso():
+    """Load the last known ISO timestamp for emergency session closure."""
+    if STATE_PATH.exists():
+        try:
+            data = json.loads(STATE_PATH.read_text())
+            return data.get("last_known_iso")
+        except Exception:
+            pass
+    return None
+
+def detect_server_restart(current_uptime, last_uptime, threshold=120):
+    """Detect if server restarted by checking if uptime decreased significantly.
+    threshold: Consider it a restart if uptime dropped by more than this many seconds.
+    """
+    if current_uptime < (last_uptime - threshold):
+        return True
+    return False
+
+def close_orphaned_sessions(conn, forced_leave_time_iso, period=None):
+    """Close any sessions that don't have a leave_time, using provided timestamp.
+    Returns list of (name, duration) for sessions that were closed.
+    """
+    if period is None:
+        period = get_current_period()
+    
+    closed = []
+    rows = conn.execute(
+        "SELECT id, name, join_time FROM sessions WHERE leave_time IS NULL"
+    ).fetchall()
+    
+    for row_id, name, join_time_str in rows:
+        duration = int((datetime.fromisoformat(forced_leave_time_iso) - datetime.fromisoformat(join_time_str)).total_seconds())
+        conn.execute(
+            "UPDATE sessions SET leave_time = ?, duration_seconds = ? WHERE id = ?",
+            (forced_leave_time_iso, duration, row_id)
+        )
+        
+        conn.execute("""
+            INSERT INTO all_time_totals (name, total_seconds, session_count, last_seen)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                total_seconds = total_seconds + ?,
+                session_count = session_count + 1,
+                last_seen = ?
+        """, (name, duration, forced_leave_time_iso, duration, forced_leave_time_iso))
+        
+        conn.execute("""
+            INSERT INTO monthly_stats (name, total_seconds, session_count, last_seen, period)
+            VALUES (?, ?, 1, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                total_seconds = total_seconds + ?,
+                session_count = session_count + 1,
+                last_seen = ?
+        """, (name, duration, period, period, duration, period))
+        
+        closed.append((name, duration))
+    
+    conn.commit()
+    return closed
 
 def get_persistent_message(key):
     conn = sqlite3.connect(DB_PATH)

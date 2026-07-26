@@ -9,7 +9,8 @@ from ..utils.ftp_tracker import (
     fetch_log_new_bytes, fetch_log_content, parse_events, load_offset, save_offset,
     check_and_perform_monthly_reset, get_monthly_leaderboard_top,
     get_global_leaderboard_top, get_currently_online, get_player_by_name,
-    format_duration, get_persistent_message, set_persistent_message, replay_log_events
+    format_duration, get_persistent_message, set_persistent_message, replay_log_events,
+    detect_server_restart, close_orphaned_sessions, load_last_known_iso
 )
 from ..config import cfg
 
@@ -20,7 +21,8 @@ class TrackerCog(commands.Cog):
         self.bot = bot
         self.conn = None
         self._active_sessions = {}
-        self._last_known_offset = load_offset()
+        self._last_known_uptime = load_offset()  # Server uptime in seconds
+        self._last_known_iso = load_last_known_iso()  # ISO timestamp for emergency closure
         self._fail_count = 0
 
         self._recover_sessions()
@@ -160,8 +162,8 @@ class TrackerCog(commands.Cog):
         if not cfg.tracker_enabled:
             return
 
-        lines, new_size = await asyncio.to_thread(
-            fetch_log_new_bytes, self._last_known_offset
+        lines, current_uptime = await asyncio.to_thread(
+            fetch_log_new_bytes, self._last_known_uptime
         )
 
         if not lines:
@@ -173,15 +175,32 @@ class TrackerCog(commands.Cog):
         if self._fail_count:
             print("[Tracker] FTP connection restored")
         self._fail_count = 0
-        events = parse_events(lines)
+        
+        # ========== DETECT SERVER RESTART ==========
+        if detect_server_restart(current_uptime, self._last_known_uptime, threshold=120):
+            print(f"[Tracker] 🔄 SERVER RESTART DETECTED (uptime: {current_uptime:.1f}s < last: {self._last_known_uptime:.1f}s)")
+            
+            # Force-close all orphaned sessions using last known timestamp
+            if self._last_known_iso:
+                closed_sessions = close_orphaned_sessions(self.conn, self._last_known_iso)
+                for name, duration in closed_sessions:
+                    dur_str = format_duration(duration)
+                    print(f"[Tracker] ⚠️ Force-closed orphaned session: {name} ({dur_str})")
+            
+            # Clear active sessions memory and reset tracking
+            self._active_sessions.clear()
+        
+        # ========== PROCESS EVENTS ==========
+        events = parse_events(lines, self._last_known_uptime)
         had_events = len(events) > 0
 
-        for event_type, name in events:
+        for event_type, name, uptime_seconds in events:
             if event_type == "join":
                 if name not in self._active_sessions:
                     join_iso = datetime.utcnow().isoformat()
                     self._active_sessions[name] = join_iso
                     record_join(self.conn, name)
+                    self._last_known_iso = join_iso  # Track for emergency closure
                     print(f"[Tracker] 🟢 {name} joined")
 
             elif event_type == "leave":
@@ -189,10 +208,12 @@ class TrackerCog(commands.Cog):
                     join_iso = self._active_sessions.pop(name)
                     duration = record_leave(self.conn, name, join_iso)
                     dur_str = format_duration(duration)
+                    self._last_known_iso = datetime.utcnow().isoformat()  # Update for emergency closure
                     print(f"[Tracker] 🔴 {name} left ({dur_str})")
 
-        save_offset(new_size)
-        self._last_known_offset = new_size
+        # ========== SAVE STATE ==========
+        save_offset(current_uptime, self._last_known_iso)
+        self._last_known_uptime = current_uptime
         check_and_perform_monthly_reset()
 
         # Update persistent leaderboard if events happened
