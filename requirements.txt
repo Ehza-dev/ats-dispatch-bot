@@ -1,5 +1,6 @@
+# ========== CORE DEPENDENCIES ==========
 # Core Discord library (v2.x brings Intents & slash-command support)
-discord.py>=2.3.0
+discord.py>=2.7.0
 
 # Load .env files (tokens, API keys, channel IDs, etc.)
 python-dotenv>=1.0.0
@@ -13,9 +14,10 @@ a2s>=1.0.1
 # Simple synchronous HTTP for quick integrations and helpers
 requests>=2.31.0
 
-# Optional web framework support used by helper scripts
+# ========== OPTIONAL DEPENDENCIES ==========
+# Web framework support used by helper scripts
 Flask>=3.0.0
 
-# Development / testing helpers
+# ========== DEVELOPMENT & TESTING ==========
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
