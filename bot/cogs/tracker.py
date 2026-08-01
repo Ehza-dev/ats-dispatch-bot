@@ -1,7 +1,7 @@
 # bot/cogs/tracker.py
 import asyncio
 import discord
-from datetime import datetime
+from datetime import datetime, timedelta
 from discord.ext import commands, tasks
 from discord import app_commands
 from ..utils.ftp_tracker import (
@@ -10,6 +10,7 @@ from ..utils.ftp_tracker import (
     check_and_perform_monthly_reset, get_monthly_leaderboard_top,
     get_global_leaderboard_top, get_currently_online, get_player_by_name,
     format_duration, get_persistent_message, set_persistent_message, replay_log_events,
+    get_monthly_archive_top,
     detect_server_restart, close_orphaned_sessions, load_last_known_iso
 )
 from ..config import cfg
@@ -235,8 +236,53 @@ class TrackerCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # ========== SLASH COMMANDS ==========
-    @app_commands.command(name="top", description="Post a live-updating monthly leaderboard")
-    async def cmd_top(self, interaction: discord.Interaction):
+    @app_commands.command(name="top", description="Post a live-updating monthly leaderboard (optionally view archived month)")
+    @app_commands.describe(period="Month to show in YYYY-MM format, or 'last' for previous month")
+    async def cmd_top(self, interaction: discord.Interaction, period: str = None):
+        # If a period is provided, post archived data for that month
+        if period:
+            if period.lower() == "last":
+                now = datetime.utcnow()
+                first_of_month = now.replace(day=1)
+                prev_month_last = first_of_month - timedelta(days=1)
+                period = prev_month_last.strftime("%Y-%m")
+
+            try:
+                datetime.strptime(period, "%Y-%m")
+            except Exception:
+                await interaction.response.send_message("❌ Invalid period format — use YYYY-MM or 'last'.", ephemeral=True)
+                return
+
+            rows = get_monthly_archive_top(period, 50)
+            if not rows:
+                await interaction.response.send_message(f"ℹ️ No archived data found for `{period}`.", ephemeral=True)
+                return
+
+            embed = discord.Embed(title=f"📦 Archived Leaderboard — {period}", color=discord.Color.purple())
+            desc_parts = []
+            medals = ["🥇", "🥈", "🥉"]
+            for rank, (name, secs, _, archived_at) in enumerate(rows, 1):
+                hrs = secs // 3600
+                mins = (secs % 3600) // 60
+                prefix = medals[rank - 1] if rank <= 3 else f"`#{rank}`"
+                desc_parts.append(f"{prefix} **{name}** — {hrs}h {mins}m")
+
+            embed.description = "\n".join(desc_parts[:50])
+            embed.set_footer(text=f"Archived at {rows[0][3] if rows and rows[0][3] else 'unknown'}")
+
+            try:
+                channel = interaction.channel
+                msg = await channel.send(embed=embed)
+                await interaction.response.send_message(f"✅ Posted archived leaderboard for `{period}` (msg {msg.id}).", ephemeral=True)
+            except Exception as exc:
+                await interaction.response.send_message(f"❌ Failed to post: {exc}", ephemeral=True)
+            return
+
+        # No period provided — show current monthly leaderboard (ensure monthly rollover applied)
+        did_reset, old_period, new_period = check_and_perform_monthly_reset()
+        if did_reset:
+            await self._post_or_update_leaderboard(cfg.leaderboard_channel_id, global_=False)
+
         embed = self._build_leaderboard_embed(global_=False)
 
         msg_id, stored_chan = get_persistent_message("monthly_leaderboard")
@@ -306,6 +352,9 @@ class TrackerCog(commands.Cog):
         except Exception as exc:
             await interaction.followup.send(f"❌ Replay failed: {exc}", ephemeral=True)
 
+    # `/top` now handles archived periods via optional `period` param; separate
+    # `/postmonth` command removed to avoid duplication.
+
     # ========== STAFF COMMANDS ==========
     @app_commands.command(name="forcereset", description="Force monthly leaderboard reset (staff only)")
     @app_commands.default_permissions(manage_guild=True)
@@ -315,7 +364,7 @@ class TrackerCog(commands.Cog):
         if did_reset:
             await self._post_or_update_leaderboard(cfg.leaderboard_channel_id, global_=False)
             await interaction.followup.send(
-                f"✅ Reset complete! Archived `{old_period}`, started `{new_period}`", ephemeral=True
+                f"✅ Reset complete! Archived `{old_period}`, started `{new_period}`", ephemeral=False
             )
         else:
             await interaction.followup.send("ℹ️ No reset needed — still in same period.", ephemeral=True)

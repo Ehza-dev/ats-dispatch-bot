@@ -10,7 +10,8 @@ import ftplib
 import re
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from ..config import cfg
@@ -113,15 +114,21 @@ def is_new_period():
 
 def archive_monthly_data(conn):
     current_period = get_current_period()
-    now = datetime.utcnow().isoformat()
-    
+    now = datetime.now(timezone.utc).isoformat()
+
     conn.execute("""
         INSERT INTO monthly_archive (name, total_seconds, session_count, period, archived_at)
         SELECT name, total_seconds, session_count, ?, ?
         FROM monthly_stats
     """, (current_period, now))
     
-    new_period = datetime.utcnow().strftime("%Y-%m")
+    # Set new current period based on Eastern Time (America/New_York)
+    try:
+        EST = ZoneInfo("America/New_York")
+    except Exception:
+        # tzdata may not be available on the system; fall back to fixed -05:00 offset
+        EST = timezone(timedelta(hours=-5))
+    new_period = datetime.now(EST).strftime("%Y-%m")
     conn.execute("UPDATE metadata SET value = ? WHERE key = 'current_period'", (new_period,))
     conn.execute("UPDATE metadata SET value = ? WHERE key = 'last_reset'", (now,))
     conn.execute("DELETE FROM monthly_stats")
@@ -450,6 +457,20 @@ def get_global_leaderboard_top(n=20):
     conn.close()
     return [(name, secs, sessions, last) for name, secs, sessions, last in rows]
 
+
+def get_monthly_archive_top(period, n=20):
+    """Return top N rows from the monthly_archive for a given period (YYYY-MM)."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""
+        SELECT name, total_seconds, session_count, archived_at
+        FROM monthly_archive
+        WHERE period = ?
+        ORDER BY total_seconds DESC
+        LIMIT ?
+    """, (period, n)).fetchall()
+    conn.close()
+    return [(name, secs, sessions, archived_at) for name, secs, sessions, archived_at in rows]
+
 def get_player_by_name(name, search_monthly=True, search_all_time=False):
     if search_monthly:
         conn = sqlite3.connect(DB_PATH)
@@ -488,13 +509,81 @@ def get_currently_online():
 def check_and_perform_monthly_reset():
     if not is_new_period():
         return False, None, None
-    
+
     conn = init_db()
-    old_period, new_period = archive_monthly_data(conn)
+
+    # Determine periods using Eastern Time (America/New_York)
+    try:
+        EST = ZoneInfo("America/New_York")
+    except Exception:
+        EST = timezone(timedelta(hours=-5))
+    old_period = get_current_period()
+    now_est = datetime.now(EST)
+    new_period = now_est.strftime("%Y-%m")
+
+    # Boundary timestamp = start of the new period in EST, converted to UTC (naive UTC ISO stored)
+    boundary_est = now_est.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    boundary_utc = boundary_est.astimezone(timezone.utc)
+    # Convert to naive UTC for storage/comparison (matches existing naive UTC timestamps)
+    boundary_utc_naive = boundary_utc.replace(tzinfo=None)
+    boundary_iso = boundary_utc_naive.isoformat()
+
+    # Close any active sessions that started before the boundary and reopen them at the boundary
+    rows = conn.execute(
+        "SELECT id, name, join_time FROM sessions WHERE leave_time IS NULL"
+    ).fetchall()
+
+    for row_id, name, join_time_str in rows:
+        try:
+            join_dt = datetime.fromisoformat(join_time_str)
+        except Exception:
+            # skip malformed timestamps
+            continue
+
+        # Only split sessions that began before the new-period boundary (compare naive UTC)
+        if join_dt < boundary_utc_naive:
+            # Duration for previous period (closed at boundary)
+            duration_prev = int((boundary_utc_naive - join_dt).total_seconds())
+
+            # Update the existing session to end at the boundary and attribute it to the old period
+            conn.execute(
+                "UPDATE sessions SET leave_time = ?, duration_seconds = ?, period = ? WHERE id = ?",
+                (boundary_iso, duration_prev, old_period, row_id),
+            )
+
+            # Credit totals for the closed portion
+            conn.execute("""
+                INSERT INTO all_time_totals (name, total_seconds, session_count, last_seen)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    total_seconds = total_seconds + ?,
+                    session_count = session_count + 1,
+                    last_seen = ?
+            """, (name, duration_prev, boundary_iso, duration_prev, boundary_iso))
+
+            conn.execute("""
+                INSERT INTO monthly_stats (name, total_seconds, session_count, last_seen, period)
+                VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    total_seconds = total_seconds + ?,
+                    session_count = session_count + 1,
+                    last_seen = ?
+            """, (name, duration_prev, boundary_iso, old_period, duration_prev, boundary_iso))
+
+            # Re-open a new session starting at the boundary for the new period
+            conn.execute(
+                "INSERT INTO sessions (name, join_time, period) VALUES (?, ?, ?)",
+                (name, boundary_iso, new_period),
+            )
+
+    conn.commit()
+
+    # Archive monthly_stats (which now includes closed portions above)
+    archived_period, next_period = archive_monthly_data(conn)
     conn.close()
-    
-    print(f"[Tracker] Monthly reset complete: archived {old_period}, started {new_period}")
-    return True, old_period, new_period
+
+    print(f"[Tracker] Monthly reset complete: archived {archived_period}, started {next_period}")
+    return True, archived_period, next_period
 
 # Track processed events by line hash (per-cog instance)
 _processed_lines = set()

@@ -1,0 +1,8 @@
+{
+  "target_channel_id": 1465783625495740679,
+  "target_category_id": 0,
+  "name_prefix": "Convoy Status",
+  "display_max": 20,
+  "paused": false,
+  "move_enabled": true
+}
