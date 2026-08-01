@@ -360,14 +360,20 @@ class TrackerCog(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     async def cmd_forcereset(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        did_reset, old_period, new_period = check_and_perform_monthly_reset()
+        try:
+            # Force an immediate archive regardless of period (create backup first)
+            did_reset, old_period, new_period = force_monthly_reset_opts(dry_run=False, create_backup=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Forced reset failed: {exc}", ephemeral=True)
+            return
+
         if did_reset:
             await self._post_or_update_leaderboard(cfg.leaderboard_channel_id, global_=False)
             await interaction.followup.send(
-                f"✅ Reset complete! Archived `{old_period}`, started `{new_period}`", ephemeral=False
+                f"✅ Forced reset complete! Archived `{old_period}`, started `{new_period}`", ephemeral=False
             )
         else:
-            await interaction.followup.send("ℹ️ No reset needed — still in same period.", ephemeral=True)
+            await interaction.followup.send("ℹ️ Forced reset did not perform any archive.", ephemeral=True)
 
     @app_commands.command(name="synctracker", description="Reload tracker config (staff only)")
     @app_commands.default_permissions(manage_guild=True)

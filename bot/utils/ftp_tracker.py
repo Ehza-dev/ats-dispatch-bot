@@ -10,6 +10,9 @@ import ftplib
 import re
 import json
 import sqlite3
+import shutil
+import tempfile
+import time
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -583,6 +586,175 @@ def check_and_perform_monthly_reset():
     conn.close()
 
     print(f"[Tracker] Monthly reset complete: archived {archived_period}, started {next_period}")
+    return True, archived_period, next_period
+
+
+def force_monthly_reset():
+    """Force an immediate monthly rollover/archive regardless of current period.
+    Returns (True, archived_period, next_period) on success.
+    """
+    conn = init_db()
+
+    # Determine periods using Eastern Time (America/New_York) with fallback
+    try:
+        est = ZoneInfo("America/New_York")
+    except Exception:
+        est = timezone(timedelta(hours=-5))
+
+    old_period = get_current_period()
+    now_est = datetime.now(est)
+    new_period = now_est.strftime("%Y-%m")
+
+    # Boundary timestamp = start of the new period in EST, converted to UTC naive
+    boundary_est = now_est.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    boundary_utc = boundary_est.astimezone(timezone.utc)
+    boundary_utc_naive = boundary_utc.replace(tzinfo=None)
+    boundary_iso = boundary_utc_naive.isoformat()
+
+    # Close active sessions that began before the boundary and reopen them at the boundary
+    rows = conn.execute(
+        "SELECT id, name, join_time FROM sessions WHERE leave_time IS NULL"
+    ).fetchall()
+
+    for row_id, name, join_time_str in rows:
+        try:
+            join_dt = datetime.fromisoformat(join_time_str)
+        except Exception:
+            continue
+
+        if join_dt < boundary_utc_naive:
+            duration_prev = int((boundary_utc_naive - join_dt).total_seconds())
+            conn.execute(
+                "UPDATE sessions SET leave_time = ?, duration_seconds = ?, period = ? WHERE id = ?",
+                (boundary_iso, duration_prev, old_period, row_id),
+            )
+
+            conn.execute("""
+                INSERT INTO all_time_totals (name, total_seconds, session_count, last_seen)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    total_seconds = total_seconds + ?,
+                    session_count = session_count + 1,
+                    last_seen = ?
+            """, (name, duration_prev, boundary_iso, duration_prev, boundary_iso))
+
+            conn.execute("""
+                INSERT INTO monthly_stats (name, total_seconds, session_count, last_seen, period)
+                VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    total_seconds = total_seconds + ?,
+                    session_count = session_count + 1,
+                    last_seen = ?
+            """, (name, duration_prev, boundary_iso, old_period, duration_prev, boundary_iso))
+
+            conn.execute(
+                "INSERT INTO sessions (name, join_time, period) VALUES (?, ?, ?)",
+                (name, boundary_iso, new_period),
+            )
+
+    conn.commit()
+
+    # Archive the monthly_stats into monthly_archive
+    archived_period, next_period = archive_monthly_data(conn)
+    conn.close()
+
+    print(f"[Tracker] Forced monthly reset complete: archived {archived_period}, started {next_period}")
+    return True, archived_period, next_period
+
+
+def force_monthly_reset_opts(dry_run=False, create_backup=True, db_path=None):
+    """Force a monthly reset with options:
+    - dry_run: operate on a temporary copy and don't mutate the real DB
+    - create_backup: when not dry_run, create a timestamped backup before mutating
+    - db_path: optional Path to the DB to operate on (for testing)
+    Returns (True, archived_period, next_period)
+    """
+    src_db = Path(db_path) if db_path else DB_PATH
+
+    # If dry_run, copy DB to temp; else operate on source (but create backup first)
+    if dry_run:
+        tmp_dir = tempfile.gettempdir()
+        ts = int(time.time())
+        tmp_db = Path(tmp_dir) / f"tracker_dryrun_{ts}.db"
+        if src_db.exists():
+            shutil.copy2(src_db, tmp_db)
+        working_db = tmp_db
+    else:
+        working_db = src_db
+        if create_backup and src_db.exists():
+            bak = src_db.with_suffix(f".bak.{int(time.time())}")
+            try:
+                shutil.copy2(src_db, bak)
+                print(f"[Tracker] Backup created: {bak}")
+            except Exception as e:
+                print(f"[Tracker] Backup failed: {e}")
+
+    conn = sqlite3.connect(working_db)
+
+    # Ensure metadata exists when operating on fresh DB
+    if not dry_run:
+        init_db()
+
+    # Determine periods using EST with fallback
+    try:
+        est = ZoneInfo("America/New_York")
+    except Exception:
+        est = timezone(timedelta(hours=-5))
+
+    old_period = get_current_period()
+    now_est = datetime.now(est)
+    new_period = now_est.strftime("%Y-%m")
+    boundary_est = now_est.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    boundary_utc = boundary_est.astimezone(timezone.utc)
+    boundary_utc_naive = boundary_utc.replace(tzinfo=None)
+    boundary_iso = boundary_utc_naive.isoformat()
+
+    rows = conn.execute("SELECT id, name, join_time FROM sessions WHERE leave_time IS NULL").fetchall()
+    for row_id, name, join_time_str in rows:
+        try:
+            join_dt = datetime.fromisoformat(join_time_str)
+        except Exception:
+            continue
+        if join_dt < boundary_utc_naive:
+            duration_prev = int((boundary_utc_naive - join_dt).total_seconds())
+            conn.execute(
+                "UPDATE sessions SET leave_time = ?, duration_seconds = ?, period = ? WHERE id = ?",
+                (boundary_iso, duration_prev, old_period, row_id),
+            )
+            conn.execute("""
+                INSERT INTO all_time_totals (name, total_seconds, session_count, last_seen)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    total_seconds = total_seconds + ?,
+                    session_count = session_count + 1,
+                    last_seen = ?
+            """, (name, duration_prev, boundary_iso, duration_prev, boundary_iso))
+            conn.execute("""
+                INSERT INTO monthly_stats (name, total_seconds, session_count, last_seen, period)
+                VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    total_seconds = total_seconds + ?,
+                    session_count = session_count + 1,
+                    last_seen = ?
+            """, (name, duration_prev, boundary_iso, old_period, duration_prev, boundary_iso))
+            conn.execute(
+                "INSERT INTO sessions (name, join_time, period) VALUES (?, ?, ?)",
+                (name, boundary_iso, new_period),
+            )
+
+    conn.commit()
+
+    archived_period, next_period = archive_monthly_data(conn)
+    conn.close()
+
+    # Remove temp DB if dry_run
+    if dry_run and 'tmp_db' in locals() and tmp_db.exists():
+        try:
+            tmp_db.unlink()
+        except Exception:
+            pass
+
+    print(f"[Tracker] Forced monthly reset complete (opts): archived {archived_period}, started {next_period}")
     return True, archived_period, next_period
 
 # Track processed events by line hash (per-cog instance)
